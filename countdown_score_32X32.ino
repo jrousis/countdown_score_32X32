@@ -15,6 +15,10 @@
 #include "fonts/scoreboard.h"
 #include "Chrono.h"
 
+//EEPROM data ADDRESSER
+#define EEP_COUNTDOWN_SET 0
+
+#define TIMEOUT_SET 4
 #define RS485_ENABLE 0
 #define RXD2 16
 #define TXD2 17
@@ -46,7 +50,7 @@ portMUX_TYPE falshMux = portMUX_INITIALIZER_UNLOCKED;
 --------------------------------------------------------------------------------------*/
 #define INSTR_START 0x11
 #define INSTR_STOP 0x12
-#define INSTR_LAPS_START 0x13
+#define INSTR_COUNTDOWN_MODE 0x13
 #define INSTR_RESET 0x14
 
 #define COUNTDOWN_EN 1
@@ -56,6 +60,7 @@ bool remote_start = false;
 bool remote_stop = false;
 bool remote_reset = false;
 
+static unsigned long oldTime = 0;
 uint8_t buzzer_cnt = 0;
 uint8_t flash_cnt = 0;
 bool flash_on = false;
@@ -63,7 +68,12 @@ bool Scan = false;
 uint8_t Address;
 uint8_t In_bytes_count = 0;
 uint16_t Timeout_delay = 0;
+unsigned int compare_elapsed = 10000;
+uint16_t countdown_time;
+bool countdown_on = false;
+bool countdown_set_on = false;
 char score[4] = { '0','0','0',0 };
+char countdown_buf[6] = { '0','0',':','0','0',0 };
 
 char  Line1_buf[10] = { 0 };
 char  Line2_buf[10] = { 0 };
@@ -113,6 +123,28 @@ void IRAM_ATTR FlashInt()
 
 TaskHandle_t Task0;
 
+//----------------------------------------------------------------------------------------
+void EEPWriteArray(char address, char* arr)
+{
+    unsigned char k;
+    for (size_t i = 0; i < sizeof(arr); i++)
+    {
+        k = arr[i];
+        EEPROM.write(address + i, k);        
+    }
+    EEPROM.commit();
+}
+
+void EEPReadArray(char address, char *arr)
+{
+    unsigned char k;
+    for (size_t i = 0; i < sizeof(arr); i++)
+    {
+        k = EEPROM.read(address + i);
+        arr[i] = k;
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -126,9 +158,12 @@ void setup()
     digitalWrite(BUZZER, LOW);
 
     EEPROM.begin(EEPROM_SIZE);
-    /*EEPROM.write(0, 33);
-    EEPROM.commit();*/
-    Address = EEPROM.read(0);
+    EEPReadArray(EEP_COUNTDOWN_SET, countdown_buf);
+    if (countdown_buf[0] == 0xff && countdown_buf[1])
+    {
+        countdown_buf[0] = '0'; countdown_buf[1] = '0'; countdown_buf[2] = ':';
+        countdown_buf[3] = '0'; countdown_buf[4] = '0';
+    }
 
     delay(100);
     Serial.println("Start initialize...");
@@ -168,11 +203,7 @@ void setup()
     dmd.drawString(1, 24, "V1.1   ", 6, GRAPHICS_NORMAL);
     delay(2000);
 
-    dmd.selectFont(scoreboard);
-    dmd.clearScreen(true);
-    dmd.drawString(1, 1, "00:00", 5, GRAPHICS_NORMAL);
-    dmd.drawString(11, 21, score, 3, GRAPHICS_NORMAL);
-    stop_sympol(GRAPHICS_NORMAL);
+    show_scoreboard();
 
     //create a task that will be executed in the Task1code() function, with priority 1 and executed on core 0
     xTaskCreatePinnedToCore(
@@ -193,20 +224,38 @@ void Task0code(void* pvParameters) {
     int minutes = 0;
     int seconds = 0;
     uint8_t laps_count = 0;
-    uint8_t lap_mode = 0;
-    unsigned int compare_elapsed = 10000;
+    uint8_t lap_mode = 0;    
     char buffer[5];
     char Clock_display[6];
     for (;;) {
-        if (chrono.hasPassed(COUNTDOWN_TIME))
+        if (countdown_on && chrono.hasPassed(countdown_time))
         {
+            chrono.restart();
             chrono.stop();
-            buzzer_cnt = 4;
+            timerAlarmDisable(flash_timer);
+
             digitalWrite(BUZZER, HIGH);
-            play_sympol(GRAPHICS_INVERSE);
-            stop_sympol(GRAPHICS_NORMAL);
-            //chrono.restart();
-            
+            dmd.clearScreen(true);
+            delay(1000);
+            digitalWrite(BUZZER, LOW);
+            show_scoreboard();
+
+            delay(1000);
+            digitalWrite(BUZZER, HIGH);
+            dmd.clearScreen(true);
+            delay(1000);
+            digitalWrite(BUZZER, LOW);
+            show_scoreboard();
+
+            delay(1000);
+            digitalWrite(BUZZER, HIGH);
+            dmd.clearScreen(true);            
+            delay(1000);
+            digitalWrite(BUZZER, LOW);
+            show_scoreboard();
+
+            timerAlarmEnable(flash_timer);
+            countdown_on = false;
         }
         if (compare_elapsed != chrono.elapsed())
         {
@@ -216,7 +265,14 @@ void Task0code(void* pvParameters) {
                 minutes = 0;
                 seconds = 0;
             }
-            int countdown_elapled = COUNTDOWN_TIME - chrono.elapsed();
+            int countdown_elapled;
+            if (countdown_on){
+                countdown_elapled = countdown_time - chrono.elapsed();
+            }
+            else {
+                countdown_elapled = chrono.elapsed();
+            }
+            
             seconds = countdown_elapled % 60;
             minutes = (countdown_elapled / 60) % 60;
             /*seconds = chrono.elapsed() % 60;
@@ -269,7 +325,7 @@ void loop()
         Serial.print(received_bytes[2], HEX);
         Serial.println();
 
-        if (received_bytes[0] != 0xAB || received_bytes[0] != 0xAB)
+        if (received_bytes[0] != 0xAB || received_bytes[1] != 0xFF)
         {
             Serial.print("IR Wrong instruction...");
         }
@@ -287,8 +343,16 @@ void loop()
             play_sympol(GRAPHICS_INVERSE);
             stop_sympol(GRAPHICS_NORMAL);
             clear_score();
+            countdown_on = false;
+            compare_elapsed = 10000;
             break;
-
+        case INSTR_COUNTDOWN_MODE:
+            if (!chrono.isRunning())
+            {
+                compare_elapsed = 10000;
+                countdown_on = true;
+            }           
+            break;
         case INSTR_START:
             if (chrono.isRunning())
             {
@@ -327,7 +391,104 @@ void loop()
         case 0x34:
             dec_score_digit(1, 2);
             break;
-
+//---------------------------------------------------------------------------
+        case 0x81:       //instruction for coundown set Minutes +10
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[0]++;
+                if (countdown_buf[0] > '9') { countdown_buf[0] = '0'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {                
+                show_countdown_set();
+            }            
+            break;
+        case 0x91:       //instruction for coundown set Minutes -10
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[0]--;
+                if (countdown_buf[0] < '0') { countdown_buf[0] = '9'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }            
+            break;
+        case 0x82:       //instruction for coundown set Minutes +1
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[1]++;
+                if (countdown_buf[1] > '9') { countdown_buf[1] = '0'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }            
+            break;
+        case 0x92:       //instruction for coundown set Minutes -1
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[1]--;
+                if (countdown_buf[1] < '0') { countdown_buf[1] = '9'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }            
+            break;
+        case 0x83:       //instruction for coundown set Seconds +10
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[3]++;
+                if (countdown_buf[3] > '9') { countdown_buf[3] = '0'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }
+            break;
+        case 0x93:       //instruction for coundown set Seconds -10
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[3]--;
+                if (countdown_buf[3] < '0') { countdown_buf[3] = '9'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }
+            break;
+        case 0x84:       //instruction for coundown set Seconds +1
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[4]++;
+                if (countdown_buf[4] > '9') { countdown_buf[4] = '0'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }
+            break;
+        case 0x94:       //instruction for coundown set Seconds -1
+            if (countdown_set_on)
+            {
+                Timeout_delay = TIMEOUT_SET;
+                countdown_buf[4]--;
+                if (countdown_buf[4] < '0') { countdown_buf[4] = '9'; }
+                dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+            }
+            else {
+                show_countdown_set();
+            }
+            break;
+//----------------------------------------------------------------------------------------------
         case INSTR_STOP:
             chrono.stop();
             play_sympol(GRAPHICS_INVERSE);
@@ -346,7 +507,15 @@ void loop()
             Timeout_delay--;
             if (!Timeout_delay)
             {
-                Serial.print("IR Wrong instruction...");
+                //Serial.print("IR Wrong instruction...");
+                if (countdown_set_on) {
+                    show_scoreboard();
+                    countdown_set_on = false;
+                    timerAlarmDisable(timer);
+                    EEPWriteArray(EEP_COUNTDOWN_SET, countdown_buf);
+                    timerAlarmEnable(timer);
+                }
+                
             }
         }
         //switchi = !switchi;
@@ -444,4 +613,31 @@ void stop_sympol(byte on) {
 void buzzer_ring(uint8_t time_last) {
     buzzer_cnt = time_last;
     digitalWrite(BUZZER, HIGH);
+}
+
+void show_scoreboard() {
+    countdown_time_calculate();
+    dmd.selectFont(scoreboard);
+    dmd.clearScreen(true);
+    dmd.drawString(1, 1, "00:00", 5, GRAPHICS_NORMAL);
+    dmd.drawString(11, 21, score, 3, GRAPHICS_NORMAL);
+    stop_sympol(GRAPHICS_NORMAL);
+}
+
+void show_countdown_set() {
+    countdown_set_on = true;
+    Timeout_delay = 3; oldTime = millis();
+    dmd.selectFont(SystemFont5x7);
+    dmd.clearScreen(true);
+    dmd.drawString(1, 8, "CDown", 5, GRAPHICS_NORMAL);
+    dmd.drawString(1, 16, "Set:", 4, GRAPHICS_NORMAL);
+    dmd.drawString(1, 24, countdown_buf, 5, GRAPHICS_NORMAL);
+}
+
+void countdown_time_calculate() {
+    char buf[6];
+    buf[0] = countdown_buf[3]; buf[1] = countdown_buf[4]; buf[2] = 0;    
+    countdown_time = atoi(buf); //Calculate the Seconds
+    buf[0] = countdown_buf[0]; buf[1] = countdown_buf[1]; buf[2] = 0;
+    countdown_time += atoi(buf) * 60; //Calculate the Minutes
 }
